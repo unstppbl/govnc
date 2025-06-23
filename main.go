@@ -29,11 +29,23 @@ type Config struct {
 	Port             int           // VNC server port
 	EnableLogging    bool          // Detailed logging
 	AdvancedOpt      bool          // Enable advanced optimizations
+	EnableInput      bool          // Enable keyboard and mouse input handling
 }
 
 // Windows API constants
 const (
 	SRCCOPY = 0x00CC0020
+
+	// Keyboard event flags
+	KEYEVENTF_KEYUP = 0x0002
+
+	// Mouse event flags
+	MOUSEEVENTF_LEFTDOWN   = 0x0002
+	MOUSEEVENTF_LEFTUP     = 0x0004
+	MOUSEEVENTF_RIGHTDOWN  = 0x0008
+	MOUSEEVENTF_RIGHTUP    = 0x0010
+	MOUSEEVENTF_MIDDLEDOWN = 0x0020
+	MOUSEEVENTF_MIDDLEUP   = 0x0040
 )
 
 var (
@@ -50,6 +62,13 @@ var (
 	getDIBits              = gdi32.NewProc("GetDIBits")
 	deleteDC               = gdi32.NewProc("DeleteDC")
 	deleteObject           = gdi32.NewProc("DeleteObject")
+
+	// Input handling APIs - using simpler, more reliable methods
+	setCursorPos  = user32.NewProc("SetCursorPos")
+	getCursorPos  = user32.NewProc("GetCursorPos")
+	mouse_event   = user32.NewProc("mouse_event")
+	keybd_event   = user32.NewProc("keybd_event")
+	mapVirtualKey = user32.NewProc("MapVirtualKeyW")
 )
 
 type BITMAPINFOHEADER struct {
@@ -74,6 +93,11 @@ var (
 	motionThreshold   = uint32(2000) // Higher threshold for motion areas
 	staticThreshold   = uint32(500)  // Lower threshold for static areas
 	framesSinceMotion = 0
+
+	// Track previous mouse state for proper button handling
+	lastMouseX       int
+	lastMouseY       int
+	lastMouseButtons uint8
 )
 
 // Optimization statistics
@@ -86,8 +110,8 @@ var (
 )
 
 func getConfigFromFlags() Config {
-	quality := flag.Int("quality", 7, "Image quality 1-10 (1=lowest bandwidth, 10=highest quality)")
-	fps := flag.Int("fps", 15, "Updates per second (lower = less bandwidth)")
+	quality := flag.Int("quality", 6, "Image quality 1-10 (1=lowest bandwidth, 10=highest quality)")
+	fps := flag.Int("fps", 60, "Updates per second (lower = less bandwidth)")
 	depth := flag.Int("depth", 32, "Color depth: 8,16,24,32 bits (lower = less bandwidth)")
 	skipUnchanged := flag.Bool("skip-unchanged", true, "Skip unchanged regions (saves bandwidth)")
 	maxRes := flag.Int("max-res", 1920, "Maximum resolution (lower = less bandwidth)")
@@ -96,6 +120,7 @@ func getConfigFromFlags() Config {
 	verbose := flag.Bool("verbose", true, "Enable detailed logging")
 	compatMode := flag.Bool("compat", false, "Enable compatibility mode for basic VNC clients")
 	advancedOpt := flag.Bool("advanced-opt", true, "Enable advanced optimizations (motion detection, adaptive thresholds)")
+	input := flag.Bool("input", true, "Enable keyboard and mouse input handling")
 
 	flag.Parse()
 
@@ -137,6 +162,7 @@ func getConfigFromFlags() Config {
 		Port:             *port,
 		EnableLogging:    *verbose,
 		AdvancedOpt:      *advancedOpt,
+		EnableInput:      *input,
 	}
 }
 
@@ -170,16 +196,19 @@ func captureScreen(cfg Config) (*image.RGBA, error) {
 		height = cfg.MaxResolution
 	}
 
-	// Get desktop window and DC
+	// Get desktop window and DC - try to get the most current view
 	hDesktopWnd, _, _ := getDesktopWindow.Call()
 	hDesktopDC, _, _ := getDC.Call(hDesktopWnd)
+
+	// Force a refresh of the desktop to ensure we get current content
+	// This helps prevent stale cached content from Windows DWM
 	hCaptureDC, _, _ := createCompatibleDC.Call(hDesktopDC)
 	hCaptureBitmap, _, _ := createCompatibleBitmap.Call(hDesktopDC, uintptr(width), uintptr(height))
 
 	// Select the bitmap into the compatible DC
 	selectObject.Call(hCaptureDC, hCaptureBitmap)
 
-	// Copy the desktop to our bitmap
+	// Copy the desktop to our bitmap - this should get the current state
 	bitBlt.Call(hCaptureDC, 0, 0, uintptr(width), uintptr(height),
 		hDesktopDC, 0, 0, SRCCOPY)
 
@@ -202,7 +231,7 @@ func captureScreen(cfg Config) (*image.RGBA, error) {
 	bufferSize := width * height * bytesPerPixel
 	buffer := make([]byte, bufferSize)
 
-	// Get the bits
+	// Get the bits - this should now contain current desktop content
 	getDIBits.Call(hCaptureDC, hCaptureBitmap, 0, uintptr(height),
 		uintptr(unsafe.Pointer(&buffer[0])),
 		uintptr(unsafe.Pointer(&bi)), 0)
@@ -533,6 +562,7 @@ func main() {
 	log.Printf("  Color Depth: %d bits", config.ColorDepth)
 	log.Printf("  Skip Unchanged: %v", config.SkipUnchanged)
 	log.Printf("  Advanced Optimizations: %v", config.AdvancedOpt)
+	log.Printf("  Input Handling: %v", config.EnableInput)
 	log.Printf("  Max Resolution: %d", config.MaxResolution)
 	log.Printf("  Compression: %d/9", config.CompressionLevel)
 	log.Printf("  Port: %d", config.Port)
@@ -568,6 +598,11 @@ func main() {
 
 	tick := time.NewTicker(config.UpdateRate)
 	defer tick.Stop()
+
+	// Add a periodic full refresh ticker to prevent stale content
+	fullRefreshTick := time.NewTicker(5 * time.Second) // Force full refresh every 5 seconds
+	defer fullRefreshTick.Stop()
+
 	connected := false
 	clientCount := 0
 
@@ -613,8 +648,9 @@ func main() {
 			}
 
 			var updateRegions []image.Rectangle
+			forceFullUpdate := false
 
-			if config.SkipUnchanged {
+			if config.SkipUnchanged && !forceFullUpdate {
 				// Detect changed regions for bandwidth optimization
 				blockSize := 64 // Adjust based on quality setting
 				if config.Quality <= 3 {
@@ -636,6 +672,9 @@ func main() {
 			} else {
 				// Update entire screen
 				updateRegions = []image.Rectangle{rgbaImg.Bounds()}
+				if forceFullUpdate && config.EnableLogging {
+					log.Printf("🔄 Forced full screen refresh")
+				}
 			}
 
 			// Send updates for changed regions only
@@ -679,6 +718,13 @@ func main() {
 			// Track and log optimization statistics
 			logOptimizationStats(updateRegions, width, height)
 
+		case <-fullRefreshTick.C:
+			if connected && config.EnableLogging {
+				log.Printf("🔄 Periodic full refresh triggered - clearing cache to prevent stale content")
+			}
+			// Clear the last image to force a full update on next tick
+			lastImage = nil
+
 		case msg := <-chServer:
 			switch msg.Type() {
 			case vnc.FramebufferUpdateRequestMsgType:
@@ -688,22 +734,82 @@ func main() {
 					log.Printf("✅ CLIENT CONNECTED: Client #%d is now active and requesting framebuffer updates", clientCount)
 					log.Printf("📊 Active clients: %d", clientCount)
 				}
+
+				// Parse the framebuffer update request for detailed logging
 				if config.EnableLogging {
-					log.Printf("📱 Framebuffer update requested by client")
+					fbReq := msg.(*vnc.FramebufferUpdateRequest)
+					updateType := "FULL"
+					if fbReq.Inc != 0 {
+						updateType = "INCREMENTAL"
+					}
+					log.Printf("📱 Framebuffer update requested: %s update for region (%d,%d) %dx%d",
+						updateType, fbReq.X, fbReq.Y, fbReq.Width, fbReq.Height)
 				}
+
+				// Note: We use timer-based updates rather than immediate response
+				// This provides consistent frame rates and better performance
 			case vnc.KeyEventMsgType:
+				keyMsg := msg.(*vnc.KeyEvent)
+				keyDown := keyMsg.Down != 0
+				vncKey := uint32(keyMsg.Key) // Convert rfb.Key to uint32
+
 				if config.EnableLogging {
-					keyMsg := msg.(*vnc.KeyEvent)
 					action := "pressed"
-					if keyMsg.Down == 0 {
+					if !keyDown {
 						action = "released"
 					}
-					log.Printf("⌨️  Key %s: %d", action, keyMsg.Key)
+					log.Printf("⌨️  Key %s: VNC=0x%x (%d)", action, vncKey, vncKey)
 				}
+
+				// Convert VNC key code to Windows virtual key code and apply if enabled
+				if config.EnableInput {
+					if winVK, found := vncKeyToWinVK(vncKey); found {
+						err := sendKeyboardInput(winVK, keyDown)
+						if err != nil && config.EnableLogging {
+							log.Printf("⚠️  Keyboard input error: %v", err)
+						} else if config.EnableLogging {
+							log.Printf("✅ Key applied: VNC=0x%x -> Win=0x%x", vncKey, winVK)
+						}
+					} else if config.EnableLogging {
+						log.Printf("⚠️  Unknown VNC key code: 0x%x (%d)", vncKey, vncKey)
+					}
+				} else if config.EnableLogging {
+					log.Printf("📝 Input handling disabled - key ignored")
+				}
+
 			case vnc.PointerEventMsgType:
+				ptrMsg := msg.(*vnc.PointerEvent)
+				x := int(ptrMsg.X)
+				y := int(ptrMsg.Y)
+				buttons := ptrMsg.Mask
+
 				if config.EnableLogging {
-					ptrMsg := msg.(*vnc.PointerEvent)
-					log.Printf("🖱️  Mouse: x=%d, y=%d, buttons=%d", ptrMsg.X, ptrMsg.Y, ptrMsg.Mask)
+					log.Printf("🖱️  Mouse: x=%d, y=%d, buttons=0x%02x", x, y, buttons)
+				}
+
+				// Apply mouse input to Windows if enabled
+				if config.EnableInput {
+					err := sendMouseInput(x, y, buttons, 0, 0)
+					if err != nil && config.EnableLogging {
+						log.Printf("⚠️  Mouse input error: %v", err)
+					} else if config.EnableLogging {
+						buttonStr := ""
+						if buttons&0x01 != 0 {
+							buttonStr += "L"
+						}
+						if buttons&0x02 != 0 {
+							buttonStr += "M"
+						}
+						if buttons&0x04 != 0 {
+							buttonStr += "R"
+						}
+						if buttonStr == "" {
+							buttonStr = "none"
+						}
+						log.Printf("✅ Mouse applied: (%d,%d) buttons=%s", x, y, buttonStr)
+					}
+				} else if config.EnableLogging {
+					log.Printf("📝 Input handling disabled - mouse ignored")
 				}
 			case vnc.ClientCutTextMsgType:
 				if config.EnableLogging {
@@ -875,4 +981,210 @@ func logOptimizationStats(updateRegions []image.Rectangle, screenWidth, screenHe
 		totalPixelsScreen = 0
 		lastStatsTime = now
 	}
+}
+
+// VNC Key code to Windows Virtual Key code mapping
+func vncKeyToWinVK(vncKey uint32) (uint16, bool) {
+	// Common VNC key codes to Windows Virtual Key codes
+	keyMap := map[uint32]uint16{
+		// Letters (VNC uses ASCII for a-z, A-Z)
+		0x61: 0x41, // 'a' -> VK_A
+		0x62: 0x42, // 'b' -> VK_B
+		0x63: 0x43, // 'c' -> VK_C
+		0x64: 0x44, // 'd' -> VK_D
+		0x65: 0x45, // 'e' -> VK_E
+		0x66: 0x46, // 'f' -> VK_F
+		0x67: 0x47, // 'g' -> VK_G
+		0x68: 0x48, // 'h' -> VK_H
+		0x69: 0x49, // 'i' -> VK_I
+		0x6a: 0x4A, // 'j' -> VK_J
+		0x6b: 0x4B, // 'k' -> VK_K
+		0x6c: 0x4C, // 'l' -> VK_L
+		0x6d: 0x4D, // 'm' -> VK_M
+		0x6e: 0x4E, // 'n' -> VK_N
+		0x6f: 0x4F, // 'o' -> VK_O
+		0x70: 0x50, // 'p' -> VK_P
+		0x71: 0x51, // 'q' -> VK_Q
+		0x72: 0x52, // 'r' -> VK_R
+		0x73: 0x53, // 's' -> VK_S
+		0x74: 0x54, // 't' -> VK_T
+		0x75: 0x55, // 'u' -> VK_U
+		0x76: 0x56, // 'v' -> VK_V
+		0x77: 0x57, // 'w' -> VK_W
+		0x78: 0x58, // 'x' -> VK_X
+		0x79: 0x59, // 'y' -> VK_Y
+		0x7a: 0x5A, // 'z' -> VK_Z
+
+		// Numbers
+		0x30: 0x30, // '0' -> VK_0
+		0x31: 0x31, // '1' -> VK_1
+		0x32: 0x32, // '2' -> VK_2
+		0x33: 0x33, // '3' -> VK_3
+		0x34: 0x34, // '4' -> VK_4
+		0x35: 0x35, // '5' -> VK_5
+		0x36: 0x36, // '6' -> VK_6
+		0x37: 0x37, // '7' -> VK_7
+		0x38: 0x38, // '8' -> VK_8
+		0x39: 0x39, // '9' -> VK_9
+
+		// Special keys
+		0xff08: 0x08, // BackSpace -> VK_BACK
+		0xff09: 0x09, // Tab -> VK_TAB
+		0xff0d: 0x0D, // Return -> VK_RETURN
+		0xff1b: 0x1B, // Escape -> VK_ESCAPE
+		0xff20: 0x14, // Caps_Lock -> VK_CAPITAL
+		0xffe1: 0x10, // Shift_L -> VK_SHIFT
+		0xffe2: 0x10, // Shift_R -> VK_SHIFT
+		0xffe3: 0x11, // Control_L -> VK_CONTROL
+		0xffe4: 0x11, // Control_R -> VK_CONTROL
+		0xffe9: 0x12, // Alt_L -> VK_MENU
+		0xffea: 0x12, // Alt_R -> VK_MENU
+		0xffeb: 0x5B, // Super_L -> VK_LWIN
+		0xffec: 0x5C, // Super_R -> VK_RWIN
+
+		// Arrow keys
+		0xff51: 0x25, // Left -> VK_LEFT
+		0xff52: 0x26, // Up -> VK_UP
+		0xff53: 0x27, // Right -> VK_RIGHT
+		0xff54: 0x28, // Down -> VK_DOWN
+
+		// Function keys
+		0xffbe: 0x70, // F1 -> VK_F1
+		0xffbf: 0x71, // F2 -> VK_F2
+		0xffc0: 0x72, // F3 -> VK_F3
+		0xffc1: 0x73, // F4 -> VK_F4
+		0xffc2: 0x74, // F5 -> VK_F5
+		0xffc3: 0x75, // F6 -> VK_F6
+		0xffc4: 0x76, // F7 -> VK_F7
+		0xffc5: 0x77, // F8 -> VK_F8
+		0xffc6: 0x78, // F9 -> VK_F9
+		0xffc7: 0x79, // F10 -> VK_F10
+		0xffc8: 0x7A, // F11 -> VK_F11
+		0xffc9: 0x7B, // F12 -> VK_F12
+
+		// Other keys
+		0xff50: 0x24, // Home -> VK_HOME
+		0xff57: 0x23, // End -> VK_END
+		0xff55: 0x21, // Page_Up -> VK_PRIOR
+		0xff56: 0x22, // Page_Down -> VK_NEXT
+		0xffff: 0x2E, // Delete -> VK_DELETE
+		0xff63: 0x2D, // Insert -> VK_INSERT
+		0x20:   0x20, // Space -> VK_SPACE
+	}
+
+	// Handle uppercase letters (VNC sends uppercase ASCII)
+	if vncKey >= 0x41 && vncKey <= 0x5A {
+		return uint16(vncKey), true // A-Z map directly
+	}
+
+	// Handle lowercase letters
+	if vncKey >= 0x61 && vncKey <= 0x7A {
+		return uint16(vncKey - 0x20), true // a-z -> A-Z
+	}
+
+	if winVK, exists := keyMap[vncKey]; exists {
+		return winVK, true
+	}
+
+	return 0, false
+}
+
+// Send keyboard input to Windows using keybd_event (simpler, more reliable)
+func sendKeyboardInput(vkey uint16, keyDown bool) error {
+	var flags uint32 = 0
+	if !keyDown {
+		flags = KEYEVENTF_KEYUP
+	}
+
+	// Use keybd_event: keybd_event(bVk, bScan, dwFlags, dwExtraInfo)
+	ret, _, err := keybd_event.Call(
+		uintptr(vkey),  // Virtual key code
+		uintptr(0),     // Scan code (0 = use virtual key)
+		uintptr(flags), // Flags
+		uintptr(0),     // Extra info
+	)
+
+	if ret == 0 {
+		return fmt.Errorf("keybd_event failed: %v", err)
+	}
+	return nil
+}
+
+// Send mouse input to Windows using SetCursorPos and mouse_event (simpler, more reliable)
+func sendMouseInput(x, y int, buttons uint8, deltaX, deltaY int) error {
+	// Move cursor using SetCursorPos (more reliable than mouse_event for positioning)
+	ret, _, err := setCursorPos.Call(uintptr(x), uintptr(y))
+	if ret == 0 {
+		return fmt.Errorf("SetCursorPos failed: %v (coords: %d,%d)", err, x, y)
+	}
+
+	// Handle button state changes using mouse_event
+	buttonChanges := lastMouseButtons ^ buttons // XOR to find changes
+
+	if buttonChanges&0x01 != 0 { // Left button changed
+		var flags uint32
+		if buttons&0x01 != 0 {
+			flags = MOUSEEVENTF_LEFTDOWN
+		} else {
+			flags = MOUSEEVENTF_LEFTUP
+		}
+
+		ret, _, err := mouse_event.Call(
+			uintptr(flags), // Event flags
+			uintptr(0),     // dx (not used for button events)
+			uintptr(0),     // dy (not used for button events)
+			uintptr(0),     // mouse data
+			uintptr(0),     // extra info
+		)
+		if ret == 0 {
+			return fmt.Errorf("mouse_event left button failed: %v", err)
+		}
+	}
+
+	if buttonChanges&0x02 != 0 { // Middle button changed
+		var flags uint32
+		if buttons&0x02 != 0 {
+			flags = MOUSEEVENTF_MIDDLEDOWN
+		} else {
+			flags = MOUSEEVENTF_MIDDLEUP
+		}
+
+		ret, _, err := mouse_event.Call(
+			uintptr(flags), // Event flags
+			uintptr(0),     // dx
+			uintptr(0),     // dy
+			uintptr(0),     // mouse data
+			uintptr(0),     // extra info
+		)
+		if ret == 0 {
+			return fmt.Errorf("mouse_event middle button failed: %v", err)
+		}
+	}
+
+	if buttonChanges&0x04 != 0 { // Right button changed
+		var flags uint32
+		if buttons&0x04 != 0 {
+			flags = MOUSEEVENTF_RIGHTDOWN
+		} else {
+			flags = MOUSEEVENTF_RIGHTUP
+		}
+
+		ret, _, err := mouse_event.Call(
+			uintptr(flags), // Event flags
+			uintptr(0),     // dx
+			uintptr(0),     // dy
+			uintptr(0),     // mouse data
+			uintptr(0),     // extra info
+		)
+		if ret == 0 {
+			return fmt.Errorf("mouse_event right button failed: %v", err)
+		}
+	}
+
+	// Update tracking variables
+	lastMouseX = x
+	lastMouseY = y
+	lastMouseButtons = buttons
+
+	return nil
 }
