@@ -36,6 +36,10 @@ type Config struct {
 const (
 	SRCCOPY = 0x00CC0020
 
+	// Input event constants for SendInput
+	INPUT_KEYBOARD = 1
+	INPUT_MOUSE    = 0
+
 	// Keyboard event flags
 	KEYEVENTF_KEYUP = 0x0002
 
@@ -46,6 +50,8 @@ const (
 	MOUSEEVENTF_RIGHTUP    = 0x0010
 	MOUSEEVENTF_MIDDLEDOWN = 0x0020
 	MOUSEEVENTF_MIDDLEUP   = 0x0040
+	MOUSEEVENTF_MOVE       = 0x0001
+	MOUSEEVENTF_ABSOLUTE   = 0x8000
 )
 
 var (
@@ -63,11 +69,10 @@ var (
 	deleteDC               = gdi32.NewProc("DeleteDC")
 	deleteObject           = gdi32.NewProc("DeleteObject")
 
-	// Input handling APIs - using simpler, more reliable methods
+	// Input handling APIs - using modern SendInput API
+	sendInput     = user32.NewProc("SendInput")
 	setCursorPos  = user32.NewProc("SetCursorPos")
 	getCursorPos  = user32.NewProc("GetCursorPos")
-	mouse_event   = user32.NewProc("mouse_event")
-	keybd_event   = user32.NewProc("keybd_event")
 	mapVirtualKey = user32.NewProc("MapVirtualKeyW")
 )
 
@@ -108,6 +113,39 @@ var (
 	totalPixelsScreen int64
 	lastStatsTime     time.Time
 )
+
+// Correct INPUT structures for 64-bit Windows
+type KEYBDINPUT struct {
+	Wvk         uint16
+	Wscan       uint16
+	Dwflags     uint32
+	Time        uint32
+	DwextraInfo uintptr
+}
+
+type MOUSEINPUT struct {
+	Dx          int32
+	Dy          int32
+	MouseData   uint32
+	Dwflags     uint32
+	Time        uint32
+	DwextraInfo uintptr
+}
+
+type HARDWAREINPUT struct {
+	UMsg    uint32
+	WParamL uint16
+	WParamH uint16
+}
+
+// Properly aligned INPUT structure for 64-bit Windows
+type INPUT struct {
+	Type uint32
+	_    uint32 // Explicit padding for 64-bit alignment
+	// Union of input structures - using the largest one
+	Ki KEYBDINPUT
+	_  [8]byte // Padding to ensure proper size
+}
 
 func getConfigFromFlags() Config {
 	quality := flag.Int("quality", 6, "Image quality 1-10 (1=lowest bandwidth, 10=highest quality)")
@@ -1089,36 +1127,99 @@ func vncKeyToWinVK(vncKey uint32) (uint16, bool) {
 	return 0, false
 }
 
-// Send keyboard input to Windows using keybd_event (simpler, more reliable)
+// Send keyboard input to Windows using SendInput (modern, reliable API)
 func sendKeyboardInput(vkey uint16, keyDown bool) error {
 	var flags uint32 = 0
 	if !keyDown {
 		flags = KEYEVENTF_KEYUP
 	}
 
-	// Use keybd_event: keybd_event(bVk, bScan, dwFlags, dwExtraInfo)
-	ret, _, err := keybd_event.Call(
-		uintptr(vkey),  // Virtual key code
-		uintptr(0),     // Scan code (0 = use virtual key)
-		uintptr(flags), // Flags
-		uintptr(0),     // Extra info
+	if config.EnableLogging {
+		action := "DOWN"
+		if !keyDown {
+			action = "UP"
+		}
+		log.Printf("🔧 Sending keyboard input: VK=0x%02X (%d) %s", vkey, vkey, action)
+	}
+
+	// Create INPUT structure for keyboard input
+	input := INPUT{
+		Type: INPUT_KEYBOARD,
+		Ki: KEYBDINPUT{
+			Wvk:         vkey,
+			Wscan:       0,
+			Dwflags:     flags,
+			Time:        0,
+			DwextraInfo: 0,
+		},
+	}
+
+	// Call SendInput
+	ret, _, err := sendInput.Call(
+		uintptr(1),                      // Number of inputs
+		uintptr(unsafe.Pointer(&input)), // Pointer to INPUT array
+		uintptr(unsafe.Sizeof(input)),   // Size of INPUT structure
 	)
 
+	if config.EnableLogging {
+		log.Printf("🔧 SendInput keyboard result: ret=%d, err=%v", ret, err)
+	}
+
 	if ret == 0 {
-		return fmt.Errorf("keybd_event failed: %v", err)
+		return fmt.Errorf("SendInput keyboard failed: %v", err)
 	}
 	return nil
 }
 
-// Send mouse input to Windows using SetCursorPos and mouse_event (simpler, more reliable)
+// Send mouse input to Windows using SendInput (modern, reliable API)
 func sendMouseInput(x, y int, buttons uint8, deltaX, deltaY int) error {
-	// Move cursor using SetCursorPos (more reliable than mouse_event for positioning)
-	ret, _, err := setCursorPos.Call(uintptr(x), uintptr(y))
-	if ret == 0 {
-		return fmt.Errorf("SetCursorPos failed: %v (coords: %d,%d)", err, x, y)
+	if config.EnableLogging {
+		log.Printf("🔧 Sending mouse input: (%d,%d) buttons=0x%02X", x, y, buttons)
 	}
 
-	// Handle button state changes using mouse_event
+	// Get screen dimensions for absolute coordinate conversion
+	screenWidth, _, _ := getSystemMetrics.Call(0)  // SM_CXSCREEN
+	screenHeight, _, _ := getSystemMetrics.Call(1) // SM_CYSCREEN
+
+	if screenWidth == 0 || screenHeight == 0 {
+		return fmt.Errorf("invalid screen dimensions: %dx%d", screenWidth, screenHeight)
+	}
+
+	// Convert to absolute coordinates (0-65535 range)
+	absX := int32((int64(x) * 65535) / int64(screenWidth))
+	absY := int32((int64(y) * 65535) / int64(screenHeight))
+
+	// Create mouse input for movement
+	moveInput := INPUT{
+		Type: INPUT_MOUSE,
+	}
+
+	// We need to manually set the mouse input data since Go doesn't support unions directly
+	// Cast the Ki field to MOUSEINPUT since it's the same memory layout
+	mouseData := (*MOUSEINPUT)(unsafe.Pointer(&moveInput.Ki))
+	mouseData.Dx = absX
+	mouseData.Dy = absY
+	mouseData.MouseData = 0
+	mouseData.Dwflags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+	mouseData.Time = 0
+	mouseData.DwextraInfo = 0
+
+	// Send movement
+	ret, _, err := sendInput.Call(
+		uintptr(1),                          // Number of inputs
+		uintptr(unsafe.Pointer(&moveInput)), // Pointer to INPUT array
+		uintptr(unsafe.Sizeof(moveInput)),   // Size of INPUT structure
+	)
+
+	if config.EnableLogging {
+		log.Printf("🔧 SendInput mouse move result: ret=%d, err=%v (coords: %d,%d -> %d,%d)", ret, err, x, y, absX, absY)
+	}
+
+	if ret == 0 {
+		return fmt.Errorf("SendInput mouse move failed: %v (coords: %d,%d -> %d,%d)", err, x, y, absX, absY)
+	}
+
+	// Handle button state changes
 	buttonChanges := lastMouseButtons ^ buttons // XOR to find changes
 
 	if buttonChanges&0x01 != 0 { // Left button changed
@@ -1129,15 +1230,35 @@ func sendMouseInput(x, y int, buttons uint8, deltaX, deltaY int) error {
 			flags = MOUSEEVENTF_LEFTUP
 		}
 
-		ret, _, err := mouse_event.Call(
-			uintptr(flags), // Event flags
-			uintptr(0),     // dx (not used for button events)
-			uintptr(0),     // dy (not used for button events)
-			uintptr(0),     // mouse data
-			uintptr(0),     // extra info
+		if config.EnableLogging {
+			action := "DOWN"
+			if flags == MOUSEEVENTF_LEFTUP {
+				action = "UP"
+			}
+			log.Printf("🔧 Sending left button %s", action)
+		}
+
+		buttonInput := INPUT{Type: INPUT_MOUSE}
+		buttonMouseData := (*MOUSEINPUT)(unsafe.Pointer(&buttonInput.Ki))
+		buttonMouseData.Dx = 0
+		buttonMouseData.Dy = 0
+		buttonMouseData.MouseData = 0
+		buttonMouseData.Dwflags = flags
+		buttonMouseData.Time = 0
+		buttonMouseData.DwextraInfo = 0
+
+		ret, _, err := sendInput.Call(
+			uintptr(1),
+			uintptr(unsafe.Pointer(&buttonInput)),
+			uintptr(unsafe.Sizeof(buttonInput)),
 		)
+
+		if config.EnableLogging {
+			log.Printf("🔧 SendInput left button result: ret=%d, err=%v", ret, err)
+		}
+
 		if ret == 0 {
-			return fmt.Errorf("mouse_event left button failed: %v", err)
+			return fmt.Errorf("SendInput left button failed: %v", err)
 		}
 	}
 
@@ -1149,15 +1270,35 @@ func sendMouseInput(x, y int, buttons uint8, deltaX, deltaY int) error {
 			flags = MOUSEEVENTF_MIDDLEUP
 		}
 
-		ret, _, err := mouse_event.Call(
-			uintptr(flags), // Event flags
-			uintptr(0),     // dx
-			uintptr(0),     // dy
-			uintptr(0),     // mouse data
-			uintptr(0),     // extra info
+		if config.EnableLogging {
+			action := "DOWN"
+			if flags == MOUSEEVENTF_MIDDLEUP {
+				action = "UP"
+			}
+			log.Printf("🔧 Sending middle button %s", action)
+		}
+
+		buttonInput := INPUT{Type: INPUT_MOUSE}
+		buttonMouseData := (*MOUSEINPUT)(unsafe.Pointer(&buttonInput.Ki))
+		buttonMouseData.Dx = 0
+		buttonMouseData.Dy = 0
+		buttonMouseData.MouseData = 0
+		buttonMouseData.Dwflags = flags
+		buttonMouseData.Time = 0
+		buttonMouseData.DwextraInfo = 0
+
+		ret, _, err := sendInput.Call(
+			uintptr(1),
+			uintptr(unsafe.Pointer(&buttonInput)),
+			uintptr(unsafe.Sizeof(buttonInput)),
 		)
+
+		if config.EnableLogging {
+			log.Printf("🔧 SendInput middle button result: ret=%d, err=%v", ret, err)
+		}
+
 		if ret == 0 {
-			return fmt.Errorf("mouse_event middle button failed: %v", err)
+			return fmt.Errorf("SendInput middle button failed: %v", err)
 		}
 	}
 
@@ -1169,15 +1310,35 @@ func sendMouseInput(x, y int, buttons uint8, deltaX, deltaY int) error {
 			flags = MOUSEEVENTF_RIGHTUP
 		}
 
-		ret, _, err := mouse_event.Call(
-			uintptr(flags), // Event flags
-			uintptr(0),     // dx
-			uintptr(0),     // dy
-			uintptr(0),     // mouse data
-			uintptr(0),     // extra info
+		if config.EnableLogging {
+			action := "DOWN"
+			if flags == MOUSEEVENTF_RIGHTUP {
+				action = "UP"
+			}
+			log.Printf("🔧 Sending right button %s", action)
+		}
+
+		buttonInput := INPUT{Type: INPUT_MOUSE}
+		buttonMouseData := (*MOUSEINPUT)(unsafe.Pointer(&buttonInput.Ki))
+		buttonMouseData.Dx = 0
+		buttonMouseData.Dy = 0
+		buttonMouseData.MouseData = 0
+		buttonMouseData.Dwflags = flags
+		buttonMouseData.Time = 0
+		buttonMouseData.DwextraInfo = 0
+
+		ret, _, err := sendInput.Call(
+			uintptr(1),
+			uintptr(unsafe.Pointer(&buttonInput)),
+			uintptr(unsafe.Sizeof(buttonInput)),
 		)
+
+		if config.EnableLogging {
+			log.Printf("🔧 SendInput right button result: ret=%d, err=%v", ret, err)
+		}
+
 		if ret == 0 {
-			return fmt.Errorf("mouse_event right button failed: %v", err)
+			return fmt.Errorf("SendInput right button failed: %v", err)
 		}
 	}
 
